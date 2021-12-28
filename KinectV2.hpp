@@ -29,6 +29,8 @@ public:
 
 		depthIntrinsics = { 0 };
 
+		
+
 		if (FAILED(GetDefaultKinectSensor(&m_pKinectSensor))) {
 			throw std::runtime_error("Failed to get default sensor!");
 		}
@@ -65,17 +67,16 @@ public:
 		ICoordinateMapper* cm;
 		if (FAILED(m_pKinectSensor->get_CoordinateMapper(&cm))) {
 			throw std::runtime_error("Failed to get coordinate mapper.");
-		}
+		}		
 
 		if (FAILED(cm->GetDepthCameraIntrinsics(&depthIntrinsics))) {
 			throw std::runtime_error("Failed to read Kinect v2.0 intrinsics.");
-		}	
+		}
 	}
 
 	virtual bool getColorFrame(cv::Mat& colorMat) override {
-
-		HRESULT hr2 = m_pColorFrameReader->AcquireLatestFrame(&pColorFrame);
-		if (SUCCEEDED(hr2)) {
+		HRESULT hr = m_pColorFrameReader->AcquireLatestFrame(&pColorFrame);
+		if (SUCCEEDED(hr)) {
 			if (colorFrameSizeChanged) {
 				IFrameDescription* pFrameDescription = nullptr;
 				int nWidth = 0;
@@ -85,8 +86,6 @@ public:
 				pFrameDescription->get_Width(&nWidth);
 				pFrameDescription->get_Height(&nHeight);
 				colorMat.create(nHeight, nWidth, CV_8UC4);
-
-				/*pColorFrame->CopyConvertedFrameDataToArray(nWidth * nHeight * 4, depthMat.data, ColorImageFormat_Bgra);*/
 				colorFrameSizeChanged = false;
 				pFrameDescription->Release();
 				pFrameDescription = nullptr;
@@ -103,40 +102,27 @@ public:
 	}
 	virtual bool getDepthFrame(cv::Mat& depthMat) override {
 
-		HRESULT hr1 = m_pDepthFrameReader->AcquireLatestFrame(&pDepthFrame);
+		HRESULT hr = m_pDepthFrameReader->AcquireLatestFrame(&pDepthFrame);
 
-		if (SUCCEEDED(hr1)) {
-			//if (depthFrameSizeChanged) {
-			//	IFrameDescription* pFrameDescription = nullptr;
-			//	int nWidth = 0;
-			//	int nHeight = 0;
+		if (SUCCEEDED(hr)) {
+			IFrameDescription* pFrameDescription = nullptr;
+			int nWidth = 0;
+			int nHeight = 0;
+			pDepthFrame->get_FrameDescription(&pFrameDescription);
+			pFrameDescription->get_Width(&nWidth);
+			pFrameDescription->get_Height(&nHeight);
 
-			//	pDepthFrame->get_FrameDescription(&pFrameDescription);
-			//	pFrameDescription->get_Width(&nWidth);
-			//	pFrameDescription->get_Height(&nHeight);
-			//	depthMat.create(nHeight, nWidth, CV_16UC1);
-			//	/*pColorFrame->CopyConvertedFrameDataToArray(nWidth * nHeight * 4, depthMat.data, ColorImageFormat_Bgra);*/
-			//	depthFrameSizeChanged = false;
-			//	pFrameDescription->Release();
-			//	pFrameDescription = nullptr;
-			//}
-			//pDepthFrame->CopyFrameDataToArray(depthMat.rows * depthMat.cols, (UINT16*)depthMat.data);
+			depthMat.release();
+			UINT16* data = new UINT16[nWidth * nHeight];
 
-				IFrameDescription* pFrameDescription = nullptr;
-				int nWidth = 0;
-				int nHeight = 0;
-				pDepthFrame->get_FrameDescription(&pFrameDescription);
-				pFrameDescription->get_Width(&nWidth);
-				pFrameDescription->get_Height(&nHeight);
-				cv::Mat f;
-				f.create(nHeight, nWidth, CV_16UC1);
-				pDepthFrame->CopyFrameDataToArray(depthMat.rows * depthMat.cols, (UINT16*)f.data);
-				depthMat.create(nHeight, nWidth, CV_16UC1);
-				f.copyTo(depthMat);
+			if (FAILED(pDepthFrame->CopyFrameDataToArray(nWidth * nHeight, data))) {
 				pDepthFrame->Release();
+				return false;
+			}
 
-			//pDepthFrame->Release();
-			//pDepthFrame = nullptr;
+			depthMat = cv::Mat(cv::Size(nWidth, nHeight), CV_16UC1, (void*)data, cv::Mat::AUTO_STEP);
+			pDepthFrame->Release();
+			pDepthFrame = NULL;
 
 			return true;
 		}
@@ -144,11 +130,11 @@ public:
 		return false;
 	}
 
-	virtual void getIntrinsics(float& fx, float& fy, float& ppx, float& ppy) override {		
+	virtual void getIntrinsics(float& fx, float& fy, float& ppx, float& ppy) override {
 		fx = depthIntrinsics.FocalLengthX;
 		fy = depthIntrinsics.FocalLengthY;
 		ppx = depthIntrinsics.PrincipalPointX;
-		ppy = depthIntrinsics.PrincipalPointY;
+		ppy = depthIntrinsics.PrincipalPointY;		
 	}
 
 	~KinectV2() {

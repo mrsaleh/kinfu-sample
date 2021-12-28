@@ -4,6 +4,7 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/rgbd.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include <fstream>
 #include <iostream>
@@ -68,7 +69,15 @@ void saveConfigFile(cv::Ptr<cv::kinfu::Params> kinfu_params) {
 	configFile << "BilateralSigmaDepth" << "=" << kinfu_params->bilateral_sigma_depth << std::endl;
 	configFile << "BilateralSigmaSpatial" << "=" << kinfu_params->bilateral_sigma_spatial << std::endl;
 	configFile << "BilateralKernelSize" << "=" << kinfu_params->bilateral_kernel_size << std::endl;
-	configFile << "PyramidLevels" << "=" << kinfu_params->pyramidLevels << std::endl;
+
+	configFile << "PyramidLevels" << "=";
+	for (int i = 0; i < kinfu_params->icpIterations.size(); i++) {
+		if (i != 0)
+			configFile << ",";
+		configFile << kinfu_params->icpIterations[i];
+	}
+	configFile << std::endl;
+
 	configFile << "VolumeDimX" << "=" << kinfu_params->volumeDims[0] << std::endl;
 	configFile << "VolumeDimY" << "=" << kinfu_params->volumeDims[1] << std::endl;
 	configFile << "VolumeDimZ" << "=" << kinfu_params->volumeDims[2] << std::endl;
@@ -96,7 +105,7 @@ void applyConfigFile(cv::Ptr<cv::kinfu::Params> kinfu_params) {
 		("BilateralSigmaDepth", po::value<float>())
 		("BilateralSigmaSpatial", po::value<float>())
 		("BilateralKernelSize", po::value<int>())
-		("PyramidLevels", po::value<int>())
+		("PyramidLevels", po::value<std::string>())
 		("VolumeDimX", po::value<int>())
 		("VolumeDimY", po::value<int>())
 		("VolumeDimZ", po::value<int>())
@@ -127,14 +136,34 @@ void applyConfigFile(cv::Ptr<cv::kinfu::Params> kinfu_params) {
 		kinfu_params->bilateral_sigma_spatial = vm["BilateralSigmaSpatial"].as<float>();
 	if (vm.count("BilateralKernelSize"))
 		kinfu_params->bilateral_kernel_size = vm["BilateralKernelSize"].as<int>();
-	if (vm.count("PyramidLevels"))
-		kinfu_params->pyramidLevels = vm["PyramidLevels"].as<int>();
+	if (vm.count("PyramidLevels")) {
+		auto icp_iterations = vm["PyramidLevels"].as<std::string>();
+		
+		kinfu_params->icpIterations.clear();
+
+		do {
+			auto i = icp_iterations.find(',',0);
+			if (i == -1)
+				break;
+			std::string  s = icp_iterations.substr(0, i );
+			icp_iterations = icp_iterations.substr(i+1);
+			kinfu_params->icpIterations.push_back(std::stoi(s));
+		} while (true);
+		if (icp_iterations.length() > 0) {
+			auto s = icp_iterations;
+			kinfu_params->icpIterations.push_back(std::stoi(s));
+		}
+		kinfu_params->pyramidLevels = kinfu_params->icpIterations.size();
+	}
+
 	if (vm.count("VolumeDimX"))
 		kinfu_params->volumeDims[0] = vm["VolumeDimX"].as<int>();
 	if (vm.count("VolumeDimY"))
 		kinfu_params->volumeDims[1] = vm["VolumeDimY"].as<int>();
 	if (vm.count("VolumeDimZ"))
 		kinfu_params->volumeDims[2] = vm["VolumeDimZ"].as<int>();
+	if (vm.count("VoxelSize"))
+		kinfu_params->voxelSize = vm["VoxelSize"].as<float>();
 	if (vm.count("TSDFMinCameraMovement"))
 		kinfu_params->tsdf_min_camera_movement = vm["TSDFMinCameraMovement"].as<float>();
 	if (vm.count("TSDFMaxWeight"))
@@ -180,17 +209,32 @@ void test_values() {
 }
 
 
+float rawDepthToMeters(int depthValue) {
+	//if (depthValue < 2047) {
+	if (depthValue == 0)
+		return 0;
+
+	if (depthValue < 1500) {
+		auto result = (float)((double)(depthValue) * 0.001);
+		return result;
+	}
+	return 0.0f;
+}
+
 int main(int argc, char** argv) {
 	DepthColorizeMode depthColorizeMode = DepthColorizeMode::Color;
 
 	Sensor* cam = new KinectV2();
 	//Sensor* cam = new RealsenseV2();
 	//test_values();
-	
-	cv::Mat depthFrame, colorFrame;
+
+	cv::Mat depthFrame, colorFrame, prevDepthFrame;
 	cv::Mat colorisdDepthFrame, adjustedDepthFrame;
 
 	cv::setUseOptimized(true);
+
+	cv::rgbd::DepthCleaner depthCleaner;
+	
 
 	//Waits for sensor to get one depth frame to determine its size
 	while (!cam->getDepthFrame(depthFrame));
@@ -198,12 +242,15 @@ int main(int argc, char** argv) {
 	auto kinfu_params = cv::kinfu::Params::defaultParams();
 	float fx, fy, ppx, ppy;
 	kinfu_params->frameSize = cv::Size(depthFrame.cols, depthFrame.rows);
+
 	cam->getIntrinsics(fx, fy, ppx, ppy);
 	kinfu_params->intr = cv::Matx33f(
 		fx, 0, ppx,
 		0, fy, ppy,
 		0, 0, 1);
 	kinfu_params->depthFactor = 1000;
+
+	//kinfu_params->truncateThreshold = 1.5;
 
 	try {
 		if (fileExist("config.ini")) {
@@ -225,67 +272,75 @@ int main(int argc, char** argv) {
 	cv::UMat gpuDepthFrame(depthFrame.rows, depthFrame.cols, CV_16UC1);
 	cv::UMat gpuRenderImage;
 	cv::UMat renderImage;
+	prevDepthFrame = cv::Mat::zeros(depthFrame.rows, depthFrame.cols, CV_16UC1);
+
+	//int i = 0;
 	while (cv::waitKey(1) != 27) {
-		if (cam->getDepthFrame(depthFrame)) {			
-			erode(depthFrame, depthFrame, cv::Mat());
-			threshold(depthFrame, depthFrame, 1500, 0, cv::THRESH_TOZERO_INV);
-			
+		if (cam->getDepthFrame(depthFrame)) {
+			//std::cout << ++i << std::endl;
+			//threshold(depthFrame, depthFrame, 1500, 0, cv::THRESH_TOZERO_INV);
+
 			auto h = depthFrame.rows;
 			auto w = depthFrame.cols;
 
-			//for (int x = 0; x < w; x++) {
-			//	for (int y = 0; y < h; y++) {
-			//		if (depthFrame.at<short>(cv::Point(x, y)) > 1500) {
-			//			depthFrame.at<short>(cv::Point(x, y)) = 0;
-			//		}
-			//		if (depthFrame.at<short>(cv::Point(x, y)) < 0) {
-			//			depthFrame.at<short>(cv::Point(x, y)) = 0;
-			//		}
-			//	}
-			//}
+
+			for (int x = 0; x < w; x++) {
+				for (int y = 0; y < h; y++) {
+					if (depthFrame.at<UINT16>(cv::Point(x, y)) > 2000) {
+						depthFrame.at<UINT16>(cv::Point(x, y)) = 0;
+					}
+					if (depthFrame.at<UINT16>(cv::Point(x, y)) < 500) {
+						depthFrame.at<UINT16>(cv::Point(x, y)) = 0;
+					}
+				}
+			}
+
+						
 			
 
-			//threshold(depthFrame, depthFrame, 0, 0, THRESH_TOZERO);
-			depthFrame.copyTo(gpuDepthFrame);
-			
+			for (int x = 0; x < w; x++) {
+				for (int y = 0; y < h; y++) {
+					if (depthFrame.at<UINT16>(cv::Point(x, y)) > 1500) {
+						depthFrame.at<UINT16>(cv::Point(x, y)) = 0;
+					}
+				}
+			}
 
 			if (depthColorizeMode == DepthColorizeMode::Color) {
 				double min = 0;
 				double max = 1500;
 				//cv::minMaxIdx(depthFrame, &min, &max);
+				//cv::Mat dd = prevDepthFrame - depthFrame;
+				cv::Mat dd = depthFrame;
 				// Histogram Equalization
-				float scale = 255 / (max - min);
-				depthFrame.convertTo(adjustedDepthFrame, CV_8UC1, scale, -min * scale);
+				float scale = 255.0 / (max - min);
+				dd.convertTo(adjustedDepthFrame, CV_8UC1, scale, -min * scale);
 				applyColorMap(adjustedDepthFrame, colorisdDepthFrame, cv::COLORMAP_JET);
-				imshow("win", colorisdDepthFrame);
+				imshow("Depth Diff", adjustedDepthFrame);
+				//imshow("win", colorisdDepthFrame);
 			}
 			else {
-				depthFrame.convertTo(colorisdDepthFrame, CV_8U, 1.0 / 255);
+				depthFrame.convertTo(colorisdDepthFrame, CV_8U, 1.0 / 255.0);
 				imshow("Depth", colorisdDepthFrame);
 			}
 
 			cv::UMat points, normals;
-
+			depthFrame.copyTo(gpuDepthFrame);
 			//Kinect Fusion saves cloud on failure
 			if (cvkf->update(gpuDepthFrame)) {
-				//cvkf->render(gpuRenderImage);
-				//imshow("render", gpuRenderImage);
-				
-			}
-			else {
-
+				cvkf->render(gpuRenderImage);
+				imshow("render", gpuRenderImage);
+			}else {
 				cvkf->reset();
-
 				export_to_ply(_points, _normals);
 				after_reset = true;
 				points.release();
 				normals.release();
-
 				std::cout << "Reset" << std::endl;
 			}
 
 			if (!after_reset) {
-				cvkf->getCloud(points, normals);				
+				cvkf->getCloud(points, normals);
 			}
 
 			if (!points.empty() && !normals.empty()) {
@@ -296,6 +351,8 @@ int main(int argc, char** argv) {
 			}
 
 			after_reset = false;
+
+			depthFrame.copyTo(prevDepthFrame);
 		}
 	}
 
